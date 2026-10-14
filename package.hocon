@@ -1,0 +1,19 @@
+// An HTTP/1.1 server: kairos's libuv driver for the sockets and the tasks, llhttp for the parsing.
+package {
+  name    = "httpd"
+  version = "0.1.0"
+  sysl    = "0.1.0-alpha.11"
+}
+
+optimization = "2"
+
+requires {
+  os    = true
+  heap  = true
+  posix = true
+}
+
+dependencies {
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1", features = [uv] }
+  llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.0" }
+}

@@ -1,0 +1,290 @@
+// The server: one task accepting, and one task per connection reading requests off it, answering
+// them in order, and deciding when the connection ends.
+//
+//     val io = uv()
+//     val lp = event_loop(io)
+//     val srv = serve(io, lp, ip4("0.0.0.0", 8080)?, config("static"))?
+//
+//     on_signal(srv, libuv.SIGINT)?
+//     lp.run()
+//
+// **A connection reads, parses, then answers.** llhttp is fed whatever one read returned, so a
+// request split across reads is assembled across them and several pipelined requests in one read
+// all complete in that one feed. The parser's callback cannot await, so it only files each request
+// in the connection's inbox; the task then answers the inbox in order -- sleeping or reading a file
+// where a route says to -- and writes every answer of the batch in one write.
+//
+// **Every way a connection ends goes through one `defer`**, so a task cancelled by being dropped, a
+// peer that vanished mid-write and an ordinary `Connection: close` all leave the server's table of
+// connections the same way.
+
+import sh.sysl.kairos.Loop
+import sh.sysl.kairos.uv.{Uv, Listener, Connection}
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.llhttp.{requests, Request, Limits, Refusal, Malformed, BodyTooLarge, HeadTooLarge}
+import sysl.buf.{Buf, buf}
+import sysl.time.{Duration, millis}
+import sysl.text.{parse_int, Search}
+
+/** What a server is willing to do for a client. */
+struct Config
+    /** The directory `GET /static/<file>` reads from. */
+    root: string
+
+    /** How long a client has to send a whole request, counted from the end of the previous answer
+     * (or from the connection). A client that dribbles bytes does not move it. */
+    request_timeout: Duration
+
+    /** The largest request body held; one larger is answered 413. */
+    body_limit: usize
+
+    /** The most connections served at once; one more is answered 503 and closed. */
+    max_connections: usize
+end Config
+
+/** The defaults: ten seconds for a request, a megabyte of body, ten thousand connections. */
+config(root: string) -> Config = Config(root, millis(10000), 1048576, 10000)
+
+// One request, copied out of the parser: what llhttp hands the callback is borrowed for the call.
+private struct Req
+    method: string
+    target: string
+    minor: u8
+    body: Buf[u8]
+    keep_alive: bool
+end Req
+
+private struct Inbox
+    reqs: Buf[Req]
+
+/** One open connection, as the server's table holds it. */
+struct Peer
+    conn: &Connection
+    id: long
+
+    /** Whether the connection is between having read a request and having answered it. */
+    busy: bool
+
+/** A running server. */
+struct Server
+    io: &Uv
+    l: &Listener
+    cfg: Config
+    peers: Buf[&Peer]
+    next_id: long
+
+    /** Whether `shutdown` has been called. */
+    stopping: bool
+
+    /** Connections turned away because the table was full. */
+    turned_away: long
+
+    private watchers: Buf[&libuv.Signal]
+
+    /** The port the listener holds. */
+    port(self) -> int = self.l.port().expect("a listening port")
+
+    /** How many connections are open. */
+    open(self) -> usize = self.peers.len()
+
+    /** Stop: accept nothing more, close every idle connection, and let every connection that is
+     * answering a request finish that answer and then close. The loop ends once the last one has. */
+    shutdown(*self)
+        if self.stopping then return
+
+        self.stopping = true
+        self.l.close()
+
+        for w in self.watchers.view() do w.close()
+
+        for p in self.peers.copy()
+            if !p.busy then p.conn.close()
+    end shutdown
+
+    private admit(*self, conn: &Connection) -> &Peer
+        val p: &Peer = Peer(conn, self.next_id, false)
+
+        self.next_id += 1
+        self.peers.push(p)
+        p
+
+    private forget(*self, p: &Peer)
+        p.conn.close()
+
+        for i in 0..<self.peers.len()
+            if self.peers[i].id == p.id
+                self.peers.remove(i)
+                return
+    end forget
+end Server
+
+/** Listen on `addr` and start accepting on `lp`. */
+serve(io: &Uv, lp: &Loop[Uv], addr: libuv.Address, cfg: Config) -> Result[&Server, libuv.Error]
+    val srv: &Server = Server(io, io.listen(addr, 1024)?, cfg, buf(), 0, false, 0, buf())
+
+    lp.spawn(accept_loop(lp, srv))
+    Ok(srv)
+
+/** Shut `srv` down gracefully the first time `signum` arrives. */
+on_signal(srv: &Server, signum: i32) -> Result[unit, libuv.Error]
+    val sig = libuv.signal(srv.io.on_loop())?
+
+    sig.start_once(signum, (n) -> srv.shutdown())?
+    srv.watchers.push(sig)
+    Ok(())
+
+private async accept_loop(lp: &Loop[Uv], srv: &Server)
+    loop
+        val conn = (await srv.l.accept()) match
+            Ok(c) -> c
+            Err(_) -> return
+
+        if srv.peers.len() >= srv.cfg.max_connections
+            srv.turned_away += 1
+            lp.spawn(turn_away(lp, conn))
+        else
+            lp.spawn(session(lp, srv, srv.admit(conn)))
+
+// A connection over the cap is still answered, so the client learns why rather than seeing a reset.
+private async turn_away(lp: &Loop[Uv], conn: &Connection)
+    await lp.timeout(millis(100), conn.read())
+    await conn.write(status_only(503, "Service Unavailable").bytes)
+    await linger(lp, conn)
+    conn.close()
+
+// What a client gets after an answer that ends the connection: whatever it was still sending is
+// read and dropped for a moment before the close, so the close is not a reset that loses the answer.
+private async linger(lp: &Loop[Uv], conn: &Connection)
+    for i in 0..<16
+        val more = (await lp.timeout(millis(50), conn.read())) match
+            Some(Ok(b)) -> b.len > 0
+            _ -> false
+
+        if !more then return
+
+private async session(lp: &Loop[Uv], srv: &Server, p: &Peer)
+    defer srv.forget(p)
+
+    val conn = p.conn
+    val inbox: &Inbox = Inbox(buf())
+    var rq = requests((r) -> inbox.reqs.push(copy_of(r)), Limits(8192, srv.cfg.body_limit))
+    var deadline = lp.now() + srv.cfg.request_timeout
+
+    loop
+        val left = deadline - lp.now()
+
+        val bytes = (await lp.timeout(left, conn.read())) match
+            None ->
+                await conn.write(status_only(408, "Request Timeout").bytes)
+                await linger(lp, conn)
+                return
+            Some(Err(_)) -> return
+            Some(Ok(b)) -> b
+
+        if bytes.len == 0
+            return
+
+        p.busy = true
+
+        val fed = rq.feed(bytes)
+        var out: Buf[u8] = buf()
+        var close = false
+
+        for r in inbox.reqs.view()
+            if await answer(lp, srv, r, out)
+                close = true
+                break
+
+        val answered = inbox.reqs.len() > 0
+
+        inbox.reqs.clear()
+
+        if !close
+            fed match
+                Err(e) ->
+                    out.extend(refusal(e).bytes)
+                    close = true
+                Ok(_) -> ()
+
+        if out.len() > 0
+            (await conn.write(out.view())) match
+                Err(_) -> return
+                Ok(_) -> ()
+
+        p.busy = false
+
+        if close
+            await linger(lp, conn)
+            return
+
+        if srv.stopping then return
+        if answered then deadline = lp.now() + srv.cfg.request_timeout
+end session
+
+private copy_of(r: &Request) -> Req = Req(r.method, r.target, r.minor, r.body.copy(), r.keep_alive)
+
+// Answer one request into `out`, and say whether the connection ends after it: the client asked it
+// to, or the server began shutting down while the request was being answered.
+private async answer(lp: &Loop[Uv], srv: &Server, r: Req, out: Buf[u8]) -> bool
+    val (code, reason, body) = await route(lp, srv, r)
+    val closing = !r.keep_alive || srv.stopping
+
+    var head = s"HTTP/1.1 $code $reason\r\nContent-Length: ${body.len}\r\n"
+
+    if closing
+        head = head + "Connection: close\r\n"
+    else if r.minor == 0
+        head = head + "Connection: keep-alive\r\n"
+
+    out.extend((head + "\r\n").bytes)
+    out.extend(body)
+    closing
+
+private async route(lp: &Loop[Uv], srv: &Server, r: Req) -> (int, string, []const u8)
+    val t = r.target
+
+    if t == "/"
+        if r.method != "GET" then return (405, "Method Not Allowed", [])
+        return (200, "OK", "Hello, world!\n".bytes)
+
+    if t == "/echo"
+        if r.method != "POST" then return (405, "Method Not Allowed", [])
+        return (200, "OK", r.body.view())
+
+    if t.starts_with("/sleep?ms=")
+        if r.method != "GET" then return (405, "Method Not Allowed", [])
+
+        val ms = parse_int(t[10..<t.bytes.len]) match
+            Ok(n) if n >= 0 && n <= 60000 -> n
+            _ -> return (400, "Bad Request", "ms must be 0 to 60000\n".bytes)
+
+        await lp.sleep(millis(long(ms)))
+        return (200, "OK", "slept\n".bytes)
+
+    if t.starts_with("/static/")
+        if r.method != "GET" then return (405, "Method Not Allowed", [])
+
+        val name = t[8..<t.bytes.len]
+
+        if name.bytes.len == 0 || name.contains("/") || name.starts_with(".")
+            return (404, "Not Found", [])
+
+        return (await srv.io.read_file(srv.cfg.root + "/" + name)) match
+            Ok(b) -> (200, "OK", b)
+            Err(_) -> (404, "Not Found", [])
+
+    (404, "Not Found", [])
+end route
+
+private status_only(code: int, reason: string) -> string =
+    s"HTTP/1.1 $code $reason\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+// A request the server will not serve: 400 with llhttp's reason, 413, or 431.
+private refusal(e: Refusal) -> string = e match
+    Malformed(f) ->
+        val body = f.reason + "\n"
+
+        s"HTTP/1.1 400 Bad Request\r\nContent-Length: ${body.bytes.len}\r\nConnection: close\r\n\r\n$body"
+    BodyTooLarge(_) -> status_only(413, "Content Too Large")
+    HeadTooLarge(_) -> status_only(431, "Request Header Fields Too Large")

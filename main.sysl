@@ -1,0 +1,22 @@
+// `httpd [port] [root]` -- serve on `port` (8080) from `root` (`static`) until SIGINT or SIGTERM.
+
+import sh.sysl.kairos.event_loop
+import sh.sysl.kairos.uv.uv
+import sh.sysl.libuv
+import sh.sysl.libuv.ip4
+import sysl.text.parse_int
+
+main(args: []string)
+    val port = if args.len > 1 then parse_int(args[1]).expect("a port number") else 8080
+    val root = if args.len > 2 then args[2] else "static"
+
+    val io = uv()
+    val lp = event_loop(io)
+    val srv = serve(io, lp, ip4("0.0.0.0", port).expect("an address"), config(root))
+                  .expect("listening")
+
+    on_signal(srv, libuv.SIGINT).expect("a SIGINT watcher")
+    on_signal(srv, libuv.SIGTERM).expect("a SIGTERM watcher")
+    print(s"httpd on port ${srv.port()}, serving $root")
+    lp.run()
+    print("httpd: shut down")

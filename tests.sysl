@@ -1,0 +1,416 @@
+@tests
+
+// The server end to end, in process: each test starts one on a port the kernel chooses and drives it
+// with clients that are tasks on the same loop, writing raw bytes and asserting the exact bytes that
+// come back. Nothing in a response depends on the clock, so every answer is compared whole.
+
+import sh.sysl.kairos.{Loop, Driver, event_loop}
+import sh.sysl.kairos.uv.{Uv, uv, Connection}
+import sh.sysl.libuv
+import sh.sysl.libuv.ip4
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_lossy, Search}
+import sysl.time.{Duration, millis}
+import sysl.fs.write_bytes
+
+private struct Rig
+    io: &Uv
+    lp: &Loop[Uv]
+    srv: &Server
+
+private rig(cfg: Config = config("static")) -> Rig
+    val io = uv()
+    val lp = event_loop(io)
+
+    Rig(io, lp, serve(io, lp, local(0), cfg).expect("serving"))
+
+// Shut the server down and run the loop dry: every connection must have left the table and nothing
+// may be left on libuv's loop.
+private finish(r: Rig)
+    r.srv.shutdown()
+    r.lp.run()
+    assert_eq(r.srv.open(), 0)
+    assert(!r.io.on_loop().alive(), "nothing of the server is left on libuv's loop")
+
+private local(port: int) -> libuv.Address = ip4("127.0.0.1", port).expect("a loopback address")
+
+private async dial(r: Rig) -> &Connection = (await r.io.connect(local(r.srv.port()))).expect("connected")
+
+// Everything the server sends until it closes.
+private async drain(c: &Connection) -> string
+    var got: Buf[u8] = buf()
+
+    loop
+        val b = (await c.read()) match
+            Ok(b) -> b
+            Err(_) -> break
+
+        if b.len == 0 then break
+        got.extend(b)
+
+    c.close()
+    from_utf8_lossy(got.view())
+
+// Exactly `n` bytes, for a connection the server keeps open.
+private async take(c: &Connection, n: usize) -> string
+    var got: Buf[u8] = buf()
+
+    while got.len() < n
+        val b = (await c.read()).expect("bytes")
+
+        if b.len == 0 then break
+        got.extend(b)
+
+    from_utf8_lossy(got.view())
+
+// Write `parts` with a pause between them, so each arrives in a read of its own, then read to the end.
+private async exchange(r: Rig, parts: []const string, gap: Duration = millis(2)) -> string
+    val c = await dial(r)
+
+    for i in 0..<parts.len
+        if i > 0 then await r.lp.sleep(gap)
+        (await c.write(parts[i].bytes)).expect("written")
+
+    await drain(c)
+
+private ask(r: Rig, parts: []const string) -> string = r.lp.block_on(exchange(r, parts)).expect("ran")
+
+private ok(body: string, close: bool = true) -> string =
+    s"HTTP/1.1 200 OK\r\nContent-Length: ${body.bytes.len}\r\n" +
+    (if close then "Connection: close\r\n" else "") + "\r\n" + body
+
+private status(line: string) -> string = s"HTTP/1.1 $line\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+// ## The routes
+
+@test("GET / answers the fixed body")
+root_route()
+    val r = rig()
+
+    assert_eq(ask(r, ["GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]), ok("Hello, world!\n"))
+    finish(r)
+
+@test("GET /static/<file> answers the file, and a missing or escaping name is 404")
+static_route()
+    val r = rig()
+
+    assert_eq(ask(r, ["GET /static/hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n"]), ok("hello from a file\n"))
+    assert_eq(ask(r, ["GET /static/nope.txt HTTP/1.1\r\nConnection: close\r\n\r\n"]), status("404 Not Found"))
+    assert_eq(ask(r, ["GET /static/../package.hocon HTTP/1.1\r\nConnection: close\r\n\r\n"]), status("404 Not Found"))
+    assert_eq(ask(r, ["GET /static/.hidden HTTP/1.1\r\nConnection: close\r\n\r\n"]), status("404 Not Found"))
+    finish(r)
+
+@test("POST /echo answers the body; a wrong method is 405 and an unknown path 404")
+echo_route()
+    val r = rig()
+
+    assert_eq(ask(r, ["POST /echo HTTP/1.1\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello there"]),
+              ok("hello there"))
+    assert_eq(ask(r, ["GET /echo HTTP/1.1\r\nConnection: close\r\n\r\n"]), status("405 Method Not Allowed"))
+    assert_eq(ask(r, ["GET /nowhere HTTP/1.1\r\nConnection: close\r\n\r\n"]), status("404 Not Found"))
+    finish(r)
+
+@test("a chunked request body is reassembled")
+chunked_body()
+    val r = rig()
+    val head = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+
+    assert_eq(ask(r, [head + "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"]), ok("hello world"))
+    assert_eq(ask(r, [head + "5\r\nhel", "lo\r\n6\r", "\n world\r\n0\r\n", "\r\n"]), ok("hello world"))
+    finish(r)
+
+@test("GET /sleep answers after the time asked for, and a bad ms is 400")
+sleep_route()
+    val r = rig()
+    val start = r.io.now()
+
+    assert_eq(ask(r, ["GET /sleep?ms=40 HTTP/1.1\r\nConnection: close\r\n\r\n"]), ok("slept\n"))
+    assert(r.io.now() - start >= millis(40), "the answer waited for the sleep")
+
+    val bad = "ms must be 0 to 60000\n"
+
+    assert_eq(ask(r, ["GET /sleep?ms=x HTTP/1.1\r\nConnection: close\r\n\r\n"]),
+              s"HTTP/1.1 400 Bad Request\r\nContent-Length: ${bad.bytes.len}\r\nConnection: close\r\n\r\n$bad")
+    finish(r)
+
+private struct Count
+    n: int
+
+private async sleeper(r: Rig, done: &Count)
+    val got = await exchange(r, ["GET /sleep?ms=100 HTTP/1.1\r\nConnection: close\r\n\r\n"])
+
+    if got == ok("slept\n") then done.n += 1
+
+private async until_count(r: Rig, done: &Count, n: int)
+    while done.n < n do await r.lp.sleep(millis(5))
+
+@test("twenty sleeping requests are answered together, not one after another")
+sleeps_overlap()
+    val r = rig()
+    val done: &Count = Count(0)
+    val start = r.io.now()
+
+    for i in 0..<20 do r.lp.spawn(sleeper(r, done))
+    r.lp.block_on(until_count(r, done, 20)).expect("ran")
+
+    assert_eq(done.n, 20)
+    assert(r.io.now() - start < millis(1000), "the sleeps overlapped")
+    finish(r)
+
+// ## Keep-alive and pipelining
+
+@test("a keep-alive connection answers request after request, and Connection: close ends it")
+keep_alive_then_close()
+    val r = rig()
+
+    r.lp.block_on(keep_alive_client(r)).expect("ran")
+    finish(r)
+
+private async keep_alive_client(r: Rig)
+    val c = await dial(r)
+    val first = ok("Hello, world!\n", false)
+
+    (await c.write("GET / HTTP/1.1\r\nHost: x\r\n\r\n".bytes)).expect("written")
+    assert_eq(await take(c, first.bytes.len), first)
+
+    (await c.write("POST /echo HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc".bytes)).expect("written")
+    assert_eq(await take(c, ok("abc", false).bytes.len), ok("abc", false))
+    assert_eq(r.srv.open(), 1)
+
+    (await c.write("GET / HTTP/1.1\r\nConnection: close\r\n\r\n".bytes)).expect("written")
+    assert_eq(await drain(c), ok("Hello, world!\n"))
+
+@test("HTTP/1.0 closes unless it asks for keep-alive, and is told when it gets it")
+http_1_0()
+    val r = rig()
+
+    assert_eq(ask(r, ["GET / HTTP/1.0\r\n\r\n"]), ok("Hello, world!\n"))
+    assert_eq(ask(r, ["GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n"]),
+              "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: keep-alive\r\n\r\nHello, world!\n" +
+              ok("Hello, world!\n"))
+    finish(r)
+
+private const PIPELINE: string = "GET / HTTP/1.1\r\nHost: a\r\n\r\n" +
+    "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello" +
+    "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n" +
+    "GET /static/hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n" +
+    "GET / HTTP/1.1\r\n\r\n"
+
+private pipelined_answer() -> string =
+    ok("Hello, world!\n", false) + ok("hello", false) + ok("abc", false) + ok("hello from a file\n")
+
+@test("pipelined requests in one write are answered in order, and nothing after Connection: close")
+pipelined_one_write()
+    val r = rig()
+
+    assert_eq(ask(r, [PIPELINE]), pipelined_answer())
+    finish(r)
+
+@test("pipelined requests split at every byte boundary are answered the same")
+pipelined_every_split()
+    val r = rig()
+    val want = pipelined_answer()
+    val n = PIPELINE.bytes.len
+    var wrong = 0
+
+    for k in 1..<n
+        if ask(r, [PIPELINE[0..<k], PIPELINE[k..<n]]) != want then wrong += 1
+
+    assert_eq(wrong, 0)
+    finish(r)
+
+@test("a request dribbled a byte at a time is answered")
+dribbled()
+    val r = rig()
+    val req = "POST /echo HTTP/1.1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nwxyz"
+    var parts: Buf[string] = buf()
+
+    for i in 0..<req.bytes.len do parts.push(req[i..<i + 1])
+    assert_eq(r.lp.block_on(exchange(r, parts.view(), millis(1))).expect("ran"), ok("wxyz"))
+    finish(r)
+
+// ## Robustness
+
+@test("a client that dribbles its request is cut off with 408: bytes arriving do not move the deadline")
+slowloris()
+    val r = rig(Config("static", millis(100), 1048576, 100))
+    val start = r.io.now()
+
+    assert_eq(r.lp.block_on(exchange(r, ["GET / HTTP/1.1\r\n", "Ho", "s", "t"], millis(30))).expect("ran"),
+              status("408 Request Timeout"))
+
+    val took = r.io.now() - start
+
+    assert(took >= millis(100), "the timeout waited its deadline")
+    assert(took < millis(1000), "and not much longer")
+    finish(r)
+
+// After the 408 the server lingers, reading and dropping what the client is still sending, so the
+// close is not a reset. The linger's first read fails with EALREADY: the read the timeout gave up on
+// is still reading, because the task `lp.timeout` was handed stays alive until the match over the
+// timeout's result ends, rather than being released when the timeout returned.
+@test("a client still sending after its 408 can finish writing",
+      ignore: "sysl: an async fn's parameters are released when its task is dropped, not at its return")
+slowloris_still_sending()
+    val r = rig(Config("static", millis(100), 1048576, 100))
+
+    assert_eq(r.lp.block_on(exchange(r, ["GET / HTTP/1.1\r\n", "Ho", "s", "t", ":", " "], millis(30)))
+                  .expect("ran"),
+              status("408 Request Timeout"))
+    finish(r)
+
+@test("an idle keep-alive connection is closed after the timeout")
+idle_timeout()
+    val r = rig(Config("static", millis(80), 1048576, 100))
+
+    assert_eq(r.lp.block_on(idle_client(r)).expect("ran"),
+              ok("Hello, world!\n", false) + status("408 Request Timeout"))
+    finish(r)
+
+private async idle_client(r: Rig) -> string
+    val c = await dial(r)
+
+    (await c.write("GET / HTTP/1.1\r\n\r\n".bytes)).expect("written")
+    await drain(c)
+
+@test("a body over the limit is 413, whether it says so up front or arrives chunked")
+body_limit()
+    val r = rig(Config("static", millis(10000), 16, 100))
+
+    assert_eq(ask(r, ["POST /echo HTTP/1.1\r\nContent-Length: 20\r\n\r\n01234567890123456789"]),
+              status("413 Content Too Large"))
+    assert_eq(ask(r, ["POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" +
+                      "a\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n"]),
+              status("413 Content Too Large"))
+    assert_eq(ask(r, ["POST /echo HTTP/1.1\r\nContent-Length: 16\r\nConnection: close\r\n\r\n0123456789abcdef"]),
+              ok("0123456789abcdef"))
+    finish(r)
+
+@test("a head over 8 KiB is 431")
+head_limit()
+    val r = rig()
+    var big = "GET / HTTP/1.1\r\nX-Big: "
+
+    for i in 0..<9000 do big = big + "a"
+    assert_eq(ask(r, [big + "\r\n\r\n"]), status("431 Request Header Fields Too Large"))
+    finish(r)
+
+private bad(reason: string) -> string
+    val body = reason + "\n"
+
+    s"HTTP/1.1 400 Bad Request\r\nContent-Length: ${body.bytes.len}\r\nConnection: close\r\n\r\n$body"
+
+@test("a malformed request is 400 with llhttp's reason, after the good requests before it")
+malformed()
+    val r = rig()
+
+    assert_eq(ask(r, ["GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"]),
+              bad("Duplicate Content-Length"))
+    assert_eq(ask(r, ["GET / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"]),
+              bad("Transfer-Encoding can't be present with Content-Length"))
+    assert_eq(ask(r, ["GET / HTTP/1.1\r\n\r\nPOST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"]),
+              ok("Hello, world!\n", false) + bad("Invalid character in chunk size"))
+    assert_eq(ask(r, ["GET / HTTP/9.9\r\n\r\n"]), bad("Invalid HTTP version"))
+    finish(r)
+
+@test("a client gone before its answer is written leaves nothing behind")
+vanished_before_answer()
+    val r = rig()
+
+    r.lp.block_on(hang_up_early(r)).expect("ran")
+    r.lp.block_on(r.lp.sleep(millis(100))).expect("ran")
+    assert_eq(r.srv.open(), 0)
+    assert_eq(ask(r, ["GET / HTTP/1.1\r\nConnection: close\r\n\r\n"]), ok("Hello, world!\n"))
+    finish(r)
+
+private async hang_up_early(r: Rig)
+    val c = await dial(r)
+
+    (await c.write("GET /sleep?ms=30 HTTP/1.1\r\n\r\n".bytes)).expect("written")
+    c.close()
+
+@test("a client gone in the middle of a large answer leaves nothing behind")
+vanished_mid_answer()
+    var big: Buf[u8] = buf()
+
+    for i in 0..<(8 * 1048576) do big.push(u8(i % 251))
+    write_bytes("/tmp/httpd-test-big.bin", big.view()).expect("the fixture written")
+
+    val r = rig(config("/tmp"))
+
+    for i in 0..<5
+        r.lp.block_on(read_a_little(r)).expect("ran")
+
+    r.lp.block_on(r.lp.sleep(millis(100))).expect("ran")
+    assert_eq(r.srv.open(), 0)
+    assert_eq(ask(r, ["GET / HTTP/1.1\r\nConnection: close\r\n\r\n"]), ok("Hello, world!\n"))
+    finish(r)
+
+private async read_a_little(r: Rig)
+    val c = await dial(r)
+
+    (await c.write("GET /static/httpd-test-big.bin HTTP/1.1\r\n\r\n".bytes)).expect("written")
+
+    val first = (await c.read()).expect("the start of the answer")
+
+    assert(first.len > 0, "something arrived")
+    c.close()
+
+@test("connections over the cap are answered 503 and closed")
+connection_cap()
+    val r = rig(Config("static", millis(10000), 1048576, 2))
+
+    r.lp.block_on(over_the_cap(r)).expect("ran")
+    assert_eq(r.srv.turned_away, 1)
+    finish(r)
+
+private async over_the_cap(r: Rig)
+    val a = await dial(r)
+    val b = await dial(r)
+    val hello = ok("Hello, world!\n", false)
+
+    for c in [a, b]
+        (await c.write("GET / HTTP/1.1\r\n\r\n".bytes)).expect("written")
+        assert_eq(await take(c, hello.bytes.len), hello)
+
+    assert_eq(r.srv.open(), 2)
+    assert_eq(await exchange(r, ["GET / HTTP/1.1\r\n\r\n"]), status("503 Service Unavailable"))
+
+    a.close()
+    await r.lp.sleep(millis(20))
+    assert_eq(await exchange(r, ["GET / HTTP/1.1\r\nConnection: close\r\n\r\n"]), ok("Hello, world!\n"))
+    b.close()
+
+// ## Shutting down
+
+@test("SIGINT stops accepting and closes idle connections, and an answer in flight is finished")
+graceful_sigint()
+    val r = rig()
+    val port = r.srv.port()
+
+    on_signal(r.srv, libuv.SIGINT).expect("watching SIGINT")
+
+    val idle: &Count = Count(0)
+
+    r.lp.spawn(idle_until_closed(r, idle))
+    r.lp.spawn(interrupt_after(r, millis(30)))
+    assert_eq(ask(r, ["GET /sleep?ms=100 HTTP/1.1\r\n\r\n"]),
+              ok("slept\n"))
+    assert(r.srv.stopping, "the signal reached the server")
+
+    val refused = r.lp.block_on(r.io.connect(local(port))).expect("ran")
+
+    assert(refused.is_err(), "nothing is accepted after the signal")
+    r.lp.run()
+    assert_eq(idle.n, 1)
+    assert_eq(r.srv.open(), 0)
+    assert(!r.io.on_loop().alive(), "the listener, the connections and the watcher are all closed")
+
+private async idle_until_closed(r: Rig, done: &Count)
+    val c = await dial(r)
+
+    if (await drain(c)) == "" then done.n += 1
+
+private async interrupt_after(r: Rig, d: Duration)
+    await r.lp.sleep(d)
+    libuv.kill(libuv.pid(), libuv.SIGINT).expect("signalled")

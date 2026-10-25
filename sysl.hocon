@@ -2,7 +2,7 @@
 package {
   name    = "httpd"
   version = "0.1.0"
-  sysl    = "0.1.0-alpha.11"
+  sysl    = "0.6.0"
 }
 
 optimization = "2"
@@ -14,6 +14,6 @@ requires {
 }
 
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1", features = [uv] }
-  llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.0" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.13", features = [uv] }
+  llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.4" }
 }

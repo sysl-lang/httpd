@@ -149,7 +149,7 @@ private async accept_loop(lp: &Loop[Uv], srv: &Server)
 // A connection over the cap is still answered, so the client learns why rather than seeing a reset.
 private async turn_away(lp: &Loop[Uv], conn: &Connection)
     await lp.timeout(millis(100), conn.read())
-    await conn.write(status_only(503, "Service Unavailable").bytes)
+    _ = await conn.write(status_only(503, "Service Unavailable").bytes)
     await linger(lp, conn)
     conn.close()
 
@@ -176,7 +176,7 @@ private async session(lp: &Loop[Uv], srv: &Server, p: &Peer)
 
         val bytes = (await lp.timeout(left, conn.read())) match
             None ->
-                await conn.write(status_only(408, "Request Timeout").bytes)
+                _ = await conn.write(status_only(408, "Request Timeout").bytes)
                 await linger(lp, conn)
                 return
             Some(Err(_)) -> return

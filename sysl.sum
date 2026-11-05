@@ -1,3 +1,6 @@
 github.com/sysl-lang/kairos v0.1.13 sha256:66a0c501613928e3927b73fd543122f93bb00e158781ba8f614a6eef281e74f2
+github.com/sysl-lang/kairos v0.1.17 sha256:3d0d2128ba6d3c852f7ec00062cc0a79600ace0d6a31af785219d8eea5504771
 github.com/sysl-lang/libuv v0.1.17 sha256:f617f65ad73a9599f4f585261f85faeace2c9efe9f163014d63615a432644116
+github.com/sysl-lang/libuv v0.1.20 sha256:321384db13e72c905249f318e0be102d3fef7580b203880833546bec6857a5aa
 github.com/sysl-lang/llhttp v0.2.4 sha256:1a5c71db74194cd19f827124d00d5cd74509349fb1bf81215fa0f1f13b774072
+github.com/sysl-lang/llhttp v0.2.5 sha256:818905ee2d5835cca5d4b6fcc3cff15cf0548432482bfd6259ec4cba330bb84e
